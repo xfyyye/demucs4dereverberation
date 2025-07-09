@@ -571,7 +571,7 @@ class HTDemucs(nn.Module):
         # =============================================================================
         
         # 获取输入音频的原始长度（采样点数）
-        length = mix.shape[-1]  # 例如：441000（10秒@44.1kHz）
+        length = mix.shape[-1]  
         
         # 初始化预填充长度记录，用于后续裁剪回原始长度
         length_pre_pad = None
@@ -596,7 +596,8 @@ class HTDemucs(nn.Module):
         
         # STFT变换：将时域信号转换为频域复数谱
         z = self._spec(mix)  # (B, C, Freq, Time)
-        # z.shape: torch.Size([4, 2, 2048, 374])
+        # mix.shape: torch.Size([4, 1, 396900])
+        # z.shape: torch.Size([4, 1, 1024, 776])
         
         # 提取幅度谱或复数通道表示
         mag = self._magnitude(z).to(mix.device)  # 频域幅度谱，形状同z

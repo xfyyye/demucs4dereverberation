@@ -298,7 +298,7 @@ def get_solver_from_sig(sig, model_only=False):
         return get_solver(xp.cfg, model_only)
 
 
-@hydra_main(config_path="../conf", config_name="config_dereverberation", version_base="1.1")
+@hydra_main(config_path="../conf", config_name="config", version_base="1.1")
 def main(args):
     """
     主函数:解析参数、初始化环境、开始训练

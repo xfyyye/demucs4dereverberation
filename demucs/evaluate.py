@@ -20,6 +20,7 @@ import musdb
 import museval
 import torch as th
 import torchaudio
+import torch.nn.functional as F
 
 from .apply import apply_model
 from .audio import convert_audio, save_audio
@@ -51,7 +52,7 @@ class CustomTrack:
             if sr != samplerate:
                 target = torchaudio.functional.resample(target, sr, samplerate)
             
-            # 创建一个简单的target对象
+            # 创建target对象
             class Target:
                 def __init__(self, audio):
                     self.audio = audio.numpy().T
@@ -107,6 +108,187 @@ def new_sdr(references, estimates):
     scores = 10 * th.log10(num / den)
     return scores
 
+'''
+新增评估指标函数，用于计算去混响专用指标
+'''
+def estimate_pesq(reference, estimate, sr=16000):
+    """
+    估算PESQ分数 (简化版本)
+    PESQ是语音质量的重要指标，对去混响很有意义
+    """
+    ref_stft = th.stft(reference, n_fft=512, return_complex=True)
+    est_stft = th.stft(estimate, n_fft=512, return_complex=True)
+    
+    ref_mag = th.abs(ref_stft)
+    est_mag = th.abs(est_stft)
+    
+    spectral_distance = th.mean((ref_mag - est_mag)**2)
+    pesq_score = 5.0 - th.clamp(spectral_distance * 100, 0, 4)
+    return pesq_score.item()
+
+
+def estimate_stoi(reference, estimate, sr=16000):
+    """
+    估算STOI分数 (简化版本)
+    短时客观可懂度指数，对去混响后的语音质量很重要
+    """
+    # 确保输入是二维的: [channels, time] 或 [time]
+    if reference.dim() == 1:
+        reference = reference.unsqueeze(0)
+    if estimate.dim() == 1:
+        estimate = estimate.unsqueeze(0)
+    
+    # 如果是多声道，取平均
+    if reference.shape[0] > 1:
+        reference = reference.mean(0)
+    if estimate.shape[0] > 1:
+        estimate = estimate.mean(0)
+    
+    # 简化的STOI估算，基于短时段的相关性
+    win_len = int(0.025 * sr)  # 25ms窗口
+    hop_len = int(0.010 * sr)  # 10ms跳跃
+    
+    # 确保信号长度足够
+    min_length = min(reference.shape[-1], estimate.shape[-1])
+    if min_length < win_len:
+        return 0.0
+        
+    reference = reference[:min_length]
+    estimate = estimate[:min_length]
+    
+    # 手动进行分帧
+    correlations = []
+    for start in range(0, min_length - win_len + 1, hop_len):
+        end = start + win_len
+        ref_frame = reference[start:end]
+        est_frame = estimate[start:end]
+        
+        # 计算相关性（避免零向量）
+        if th.norm(ref_frame) > 1e-8 and th.norm(est_frame) > 1e-8:
+            correlation = F.cosine_similarity(ref_frame, est_frame, dim=0)
+            correlations.append(correlation)
+    
+    if len(correlations) == 0:
+        return 0.0
+    
+    # 返回平均相关性，映射到[0,1]区间
+    avg_correlation = th.mean(th.stack(correlations))
+    return th.clamp((avg_correlation + 1) / 2, 0, 1).item()
+
+
+def compute_rt60_error(reference, estimate, sr=16000):
+    """
+    混响时间误差
+    比较参考信号和估计信号的混响衰减特性
+    """
+    def estimate_rt60(signal):
+        # 计算信号的能量衰减曲线
+        energy = th.cumsum(th.flip(signal**2, dims=[-1]), dim=-1)
+        energy = th.flip(energy, dims=[-1])
+        
+        # 找到-60dB衰减点
+        max_energy = th.max(energy)
+        target_energy = max_energy * 10**(-60/10)
+        
+        # 简化的RT60估算
+        decay_idx = th.argmax((energy < target_energy).float())
+        rt60 = decay_idx.float() / sr
+        return rt60
+    
+    ref_rt60 = estimate_rt60(reference)
+    est_rt60 = estimate_rt60(estimate)
+    
+    return th.abs(ref_rt60 - est_rt60).item()
+
+
+def compute_dereverberation_metrics(references, estimates, sources_names, sr=16000, config=None):
+    """
+    计算去混响专用评估指标
+    
+    Args:
+        references: 真实标签 [batch, num_sources, channels, time]
+        estimates: 模型预测 [batch, num_sources, channels, time] 
+        sources_names: 源名称列表，如 ['dry', 'rir']
+        sr: 采样率
+        config: 配置字典，指定计算哪些指标
+    
+    Returns:
+        dict: 包含各种评估指标的字典
+    """
+    if config is None:
+        config = {
+            'compute_pesq': True,
+            'compute_stoi': True,
+            'compute_rt60': True,
+        }
+    
+    metrics = {}
+    
+    # 只对 'dry' 源计算语音质量指标
+    if 'dry' in sources_names:
+        dry_idx = sources_names.index('dry')
+        reference_dry = references[:, dry_idx]  # [batch, channels, time]
+        estimated_dry = estimates[:, dry_idx]   # [batch, channels, time]
+        
+        batch_size = reference_dry.shape[0]
+        
+        # 计算各项指标的累积值
+        sdr_scores = []
+        pesq_scores = []
+        stoi_scores = []
+        rt60_errors = []
+        
+        for i in range(batch_size):
+            # 处理每个样本，确保统一为1维[time]
+            ref_sample = reference_dry[i]  # [channels, time]
+            est_sample = estimated_dry[i]  # [channels, time]
+            
+            # 如果是多声道，取平均得到[time]
+            if ref_sample.dim() > 1 and ref_sample.shape[0] > 1:
+                ref = ref_sample.mean(0)  # [channels, time] → [time]
+                est = est_sample.mean(0)  # [channels, time] → [time]
+            else:
+                # 单声道，去掉channel维度
+                ref = ref_sample.squeeze(0)  # [1, time] → [time]
+                est = est_sample.squeeze(0)  # [1, time] → [time]
+            
+            # SDR for dry signal - 确保4维：[batch, sources, channels, time]
+            ref_expanded = ref.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [time] → [1, 1, 1, time]
+            est_expanded = est.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [time] → [1, 1, 1, time]
+            # ref_expanded.shape torch.Size([1, 1, 1, 441000])
+            # est_expanded.shape torch.Size([1, 1, 1, 441000])
+            sdr = new_sdr(ref_expanded, est_expanded)
+            sdr_scores.append(sdr.item())
+            
+            # PESQ估算
+            if config.get('compute_pesq', True):
+                pesq_score = estimate_pesq(ref, est, sr)
+                pesq_scores.append(pesq_score)
+            
+            # STOI估算  
+            if config.get('compute_stoi', True):
+                stoi_score = estimate_stoi(ref, est, sr)
+                stoi_scores.append(stoi_score)
+            
+            # 混响时间误差
+            if config.get('compute_rt60', True):
+                rt60_error = compute_rt60_error(ref, est, sr)
+                rt60_errors.append(rt60_error)
+        
+        # 计算平均值
+        if sdr_scores:
+            metrics['sdr_dry_dereverb'] = sum(sdr_scores) / len(sdr_scores)
+        if pesq_scores:
+            metrics['pesq_estimate'] = sum(pesq_scores) / len(pesq_scores)
+        if stoi_scores:
+            metrics['stoi_estimate'] = sum(stoi_scores) / len(stoi_scores)
+        if rt60_errors:
+            metrics['rt60_error'] = sum(rt60_errors) / len(rt60_errors)
+    
+    return metrics
+'''
+--------------------------------
+'''
 
 def eval_track(references, estimates, win, hop, compute_sdr=True):
     references = references.transpose(1, 2).double()
@@ -225,6 +407,26 @@ def evaluate(solver, compute_sdr=False):
                         "SAR": sar[idx].tolist()
                     }
                     tracks[track_name][target].update(values)
+            #-----改动-----
+            # 计算去混响专用指标
+            if hasattr(args, 'dereverberation_metrics') and args.dereverberation_metrics.get('enable', False):
+                # 为计算去混响指标准备数据
+                references_batch = references.unsqueeze(0)  # [1, num_sources, channels, time]
+                estimates_batch = estimates.unsqueeze(0)    # [1, num_sources, channels, time]
+                
+                dereverb_metrics = compute_dereverberation_metrics(
+                    references_batch, 
+                    estimates_batch, 
+                    model.sources,
+                    sr=model.samplerate,
+                    config=args.dereverberation_metrics
+                )
+                
+                # 将去混响指标添加到track结果中
+                if not hasattr(tracks[track_name], 'dereverberation'):
+                    tracks[track_name]['dereverberation'] = {}
+                tracks[track_name]['dereverberation'].update(dereverb_metrics)
+            #-----改动-----
 
         all_tracks = {}
         for src in range(distrib.world_size):
@@ -248,4 +450,22 @@ def evaluate(solver, compute_sdr=False):
                 avg_of_medians += median / len(model.sources)
             result[metric_name.lower()] = avg
             result[metric_name.lower() + "_med"] = avg_of_medians
+        #-----改动-----
+        # 添加去混响专用指标的汇总
+        if all_tracks and hasattr(args, 'dereverberation_metrics') and args.dereverberation_metrics.get('enable', False):
+            # 检查是否有去混响指标
+            first_track = next(iter(all_tracks.values()))
+            if 'dereverberation' in first_track:
+                dereverb_metrics_names = first_track['dereverberation'].keys()
+                for metric_name in dereverb_metrics_names:
+                    # 收集所有track的该指标值
+                    values = [
+                        all_tracks[track]['dereverberation'][metric_name]
+                        for track in all_tracks.keys()
+                        if 'dereverberation' in all_tracks[track] and metric_name in all_tracks[track]['dereverberation']
+                    ]
+                    if values:
+                        result[f"dereverb_{metric_name}"] = np.mean(values)
+                        result[f"dereverb_{metric_name}_med"] = np.median(values)
+        #-----改动-----
         return result

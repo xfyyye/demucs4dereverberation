@@ -92,6 +92,10 @@ class Solver(object):
         self.link = xp.link
         self.history = self.link.history
 
+        #-----改动-----
+        # 初始化去混响专用损失函数
+        self._init_dereverberation_loss()
+        #-----改动-----
         # 重置训练状态
         self._reset()
 
@@ -169,6 +173,22 @@ class Solver(object):
             if self.args.continue_opt:
                 self.optimizer.load_state_dict(package['optimizer'])
 
+    def _init_dereverberation_loss(self):
+        """初始化去混响专用损失函数"""
+        self.use_dereverb_loss = getattr(self.args, 'dereverberation_loss', {}).get('enable', False)
+        
+        if self.use_dereverb_loss:
+            from .losses import get_dereverberation_loss
+            
+            config = self.args.dereverberation_loss
+            config['sr'] = self.args.dset.samplerate  # 添加采样率
+            
+            # 创建去混响损失函数实例
+            self.dereverb_loss_fn = get_dereverberation_loss(config, device=self.device)
+            self.dereverb_loss_fn.to(self.device)
+            
+
+
     def _format_train(self, metrics: dict) -> dict:
         """
         格式化训练/验证指标
@@ -196,6 +216,17 @@ class Solver(object):
             losses['penalty'] = format(metrics['penalty'], ".4f")
         if 'hloss' in metrics:
             losses['hloss'] = format(metrics['hloss'], ".4f")
+            
+        # 添加去混响专用指标格式化
+        if 'sdr_dry_dereverb' in metrics:
+            losses['sdr_dry'] = format(metrics['sdr_dry_dereverb'], ".3f")
+        if 'pesq_estimate' in metrics:
+            losses['pesq'] = format(metrics['pesq_estimate'], ".3f")
+        if 'stoi_estimate' in metrics:
+            losses['stoi'] = format(metrics['stoi_estimate'], ".3f")
+        if 'rt60_error' in metrics:
+            losses['rt60_err'] = format(metrics['rt60_error'], ".4f")
+            
         return losses
 
     def _format_test(self, metrics: dict) -> dict:
@@ -374,20 +405,17 @@ class Solver(object):
             if train:
                 # sources = self.augment(sources)
                 # mix = sources.sum(dim=1)
-                # 改为：
+                '''
+                改为：
                 # 训练时使用预存的mixture文件（正确的卷积合成）
-                # 数据格式：[mixture, dry, rir]
-                mix = sources[:, 0]  # mixture（干声与RIR卷积的结果）
-                sources = sources[:, 1:]  # [dry, rir]
-                
-                # 进行数据增强
-                # 注意：增强需要同时应用于mix和sources
-                combined = torch.cat([mix.unsqueeze(1), sources], dim=1)  # [batch, 3, channels, time]
-                combined = self.augment(combined)
-                mix = combined[:, 0]  # 增强后的mixture
-                sources = combined[:, 1:]  # 增强后的[dry, rir]
-                # 训练时：sources.shape torch.Size([4, 2, 1, 382788]) -> [batch, num_sources, channels, time]
-                # 训练时：mix.shape torch.Size([4, 1, 382788]) -> [batch, channels, time]
+                # 数据格式：[mixture, dry, rir], sources原本就是[batch, 3, channels, time]
+                # 直接对原始sources增强（包含mixture）
+                '''
+                combined = self.augment(sources)  
+                mix = combined[:, 0]
+                sources = combined[:, 1:]
+                # 训练时：sources.shape torch.Size([4, 2, 1, 396900]) -> [batch, num_sources, channels, time]
+                # 训练时：mix.shape torch.Size([4, 1, 396900]) -> [batch, channels, time]
             else:
                 # 验证时分离混合音频和源音频
                 mix = sources[:, 0]
@@ -414,23 +442,35 @@ class Solver(object):
             # dims = (2, 3)
             
             # 计算损失
-            if args.optim.loss == 'l1':
-                # L1损失
-                loss = F.l1_loss(estimate, sources, reduction='none')
-                # 第一步：沿channels和time维度平均 # dims=(2,3) 第二步：沿batch维度平均  
-                loss = loss.mean(dims).mean(0)
-                reco = loss # 结果 shape: (num_sources,)  每个源的平均损失
-            elif args.optim.loss == 'mse':
-                # MSE损失
-                loss = F.mse_loss(estimate, sources, reduction='none')
-                loss = loss.mean(dims)
-                reco = loss**0.5
-                reco = reco.mean(0)
+            dereverb_loss_dict = {}
+            
+            if self.use_dereverb_loss and train:
+                # 使用去混响专用损失
+                loss, dereverb_loss_dict = self.dereverb_loss_fn(estimate, sources, mix)
+                # 为了兼容原有代码，从详细损失中提取重建损失作为reco
+                reco = torch.stack([
+                    dereverb_loss_dict['total_dry_loss'], 
+                    dereverb_loss_dict['total_rir_loss']
+                ])
             else:
-                raise ValueError(f"Invalid loss {self.args.loss}")
-            # 应用权重
-            weights = torch.tensor(args.weights).to(sources)
-            loss = (loss * weights).sum() / weights.sum()
+                # 使用原有的简单损失
+                if args.optim.loss == 'l1':
+                    # L1损失
+                    loss = F.l1_loss(estimate, sources, reduction='none')
+                    # 第一步：沿channels和time维度平均 # dims=(2,3) 第二步：沿batch维度平均  
+                    loss = loss.mean(dims).mean(0)
+                    reco = loss # 结果 shape: (num_sources,)  每个源的平均损失
+                elif args.optim.loss == 'mse':
+                    # MSE损失
+                    loss = F.mse_loss(estimate, sources, reduction='none')
+                    loss = loss.mean(dims)
+                    reco = loss**0.5
+                    reco = reco.mean(0)
+                else:
+                    raise ValueError(f"Invalid loss {self.args.loss}")
+                # 应用权重
+                weights = torch.tensor(args.weights).to(sources)
+                loss = (loss * weights).sum() / weights.sum()
             # 计算量化损失
             ms = 0
             if self.quantizer is not None:
@@ -440,7 +480,15 @@ class Solver(object):
 
             # 记录损失
             losses = {}
-            losses['reco'] = (reco * weights).sum() / weights.sum()
+            if self.use_dereverb_loss and train:
+                weights = torch.tensor(args.weights).to(sources)
+                losses['reco'] = (reco * weights).sum() / weights.sum()
+                # 添加去混响专用损失记录
+                for key, value in dereverb_loss_dict.items():
+                    losses[key] = value
+            else:
+                weights = torch.tensor(args.weights).to(sources) if 'weights' not in locals() else weights
+                losses['reco'] = (reco * weights).sum() / weights.sum()
             losses['ms'] = ms
             
 
@@ -452,6 +500,16 @@ class Solver(object):
                     losses[f'nsdr_{source}'] = nsdr
                     total += w * nsdr
                 losses['nsdr'] = total / weights.sum()
+                
+                # 计算去混响专用指标（只在验证时计算简单指标，详细指标在evaluate.py中）
+                if hasattr(self.args, 'dereverberation_metrics') and self.args.dereverberation_metrics.get('enable', False):
+                    from .evaluate import compute_dereverberation_metrics
+                    dereverb_metrics = compute_dereverberation_metrics(
+                        sources, estimate.detach(), 
+                        self.model.sources, sr=self.args.dset.samplerate,
+                        config=self.args.dereverberation_metrics
+                    )
+                    losses.update(dereverb_metrics)
 
             # 计算SVD惩罚项
             if train and args.svd.penalty > 0:

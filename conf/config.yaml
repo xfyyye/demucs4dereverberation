@@ -9,11 +9,11 @@ defaults:
 dummy:
 dset:
   musdb: 
-  musdb_samplerate: 44100
+  musdb_samplerate: 16000
   use_musdb: false   # set to false to not use musdb as training data.
-  wav:  /home/ps/xxn/data/dereverberation_pad
+  wav:  /home/ps/xxn/data/dereverberation
   wav2:  # second custom wav dataset
-  segment: 11
+  segment: 10
   shift: 1
   train_valid: false
   full_cv: true
@@ -26,7 +26,7 @@ dset:
   backend: null   # if provided select torchaudio backend.
 
 test:
-  save: False
+  save: True # False
   best: True
   workers: 0  # 禁用多进程评估
   every: 50   # 减少评估频率，避免频繁卡住
@@ -42,13 +42,36 @@ batch_size: 64
 max_batches:  # limit the number of batches per epoch, useful for debugging
               # or if your dataset is gigantic.
 optim:
-  lr: 3e-4
+  lr: 1e-3  # 3e-4，# 提高学习率
   momentum: 0.9
   beta2: 0.999
   loss: l1    # l1 or mse
   optim: adam
   weight_decay: 0
-  clip_grad: 0
+  clip_grad: 5.0    # 0，添加梯度裁剪，防止梯度爆炸
+
+# 新增：去混响专用损失配置
+dereverberation_loss:
+  enable: true                    # 是否启用专用去混响损失,ll
+  dry_weight: 3.0                # 干声权重
+  rir_weight: 1.0                # RIR权重  
+  time_weight: 1.0               # 时域损失权重
+  freq_weight: 0.5               # 频域损失权重
+  mel_weight: 0.3                # 感知损失权重
+  consistency_weight: 0.2        # 一致性损失权重
+  rir_reg_weight: 0.1           # RIR正则化权重
+  time_loss_type: "l1"          # 时域损失类型: l1, mse, huber
+  use_time_domain_conv: false   # 使用FFT卷积（推荐），时域卷积仅用于验证
+  n_fft: 1024                   # STFT参数
+  n_mels: 80                    # Mel频谱参数
+  sr: 16000
+
+# 新增：去混响专用评估指标配置  
+dereverberation_metrics:
+  enable: true                   # 是否启用专用评估指标
+  compute_pesq: true            # 计算PESQ估算
+  compute_stoi: true            # 计算STOI估算
+  compute_rt60: true            # 计算混响时间误差
 
 seed: 42
 debug: false
@@ -69,6 +92,9 @@ augment:
     proba: 0.5    # 降低音量缩放概率 原值1
     min: 0.8      # 缩小缩放范围，保持更真实 原值0.25
     max: 1.2      # 原值1.25
+    # proba: 0.8    # 降低音量缩放概率 原值1
+    # min: 0.85     # 缩小缩放范围，保持更真实 原值0.25
+    # max: 1.15     # 原值1.25
   flip: false     # 去混响通常不需要翻转 原值true
 
 continue_from:  # continue from other XP, give the XP Dora signature.
@@ -199,12 +225,15 @@ htdemucs:  # see demucs/htdemucs.py for a detailed description
   growth: 2
   # STFT (对16kHz采样率，2048更合适) 原值4096
   nfft: 2048
+  # # STFT - 保持4096以确保时频域维度匹配，即使对16kHz也能工作
+  # nfft: 4096
   wiener_iters: 0
   end_iters: 0
   wiener_residual: false
   cac: true
   # Main structure
   depth: 4
+  # depth: 6                 # 增加深度，从4增加到6，提升模型表达能力
   rewrite: true
   # Frequency Branch
   multi_freqs: []
